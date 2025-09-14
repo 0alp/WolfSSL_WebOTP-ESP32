@@ -476,3 +476,12 @@ const char* ota_manager_get_current_version(void)
 {
     return g_ota_config.current_version;
 }
+
+void ota_manager_deinit(void)
+{
+    if (g_ota_initialized) {
+        ota_manager_stop_check();
+        g_ota_initialized = false;
+        ESP_LOGI(TAG, "OTA Manager deinitialized");
+    }
+}
