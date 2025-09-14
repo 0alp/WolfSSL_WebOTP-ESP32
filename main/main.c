@@ -23,12 +23,12 @@
 static const char *TAG = "MAIN";
 
 // Application configuration    
-#define APP_VERSION         "1.0.0"
+#define APP_VERSION         "1.1.0"
 #define WIFI_SSID          "NETDISCOVER"
 #define WIFI_PASSWORD      "1233211231"
 #define WIFI_MAX_RETRY     5
 
-#define SERVER_HOST        "46.101.115.117"
+#define SERVER_HOST        "ota.alperenonal.com"
 #define SERVER_PORT        8000
 #define USE_HTTPS         0
 
