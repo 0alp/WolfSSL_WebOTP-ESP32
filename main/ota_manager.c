@@ -213,17 +213,16 @@ esp_err_t ota_manager_update_firmware(int firmware_id)
     
     if (g_ota_config.use_https) {
         config.transport_type = HTTP_TRANSPORT_OVER_SSL;
-        //config.skip_cert_common_name_check = true; // The same issue with [NOTE1] 
+        config.skip_cert_common_name_check = true; // The same issue with [NOTE1] 
     }
     
-    /* [NOTE1] I'm not sure but when I active this block, I get that "Firmware update failed: ESP_ERR_INVALID_ARG" It can be active for you.
     esp_https_ota_config_t ota_config = {
         .http_config = &config,
         .http_client_init_cb = NULL, 
         .partial_http_download = true,
         .max_http_request_size = 1024,
     };
-    */
+    
     esp_https_ota_handle_t https_ota_handle = NULL;
     esp_err_t err = esp_https_ota_begin(&ota_config, &https_ota_handle);
     if (err != ESP_OK) {

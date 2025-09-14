@@ -23,7 +23,7 @@
 static const char *TAG = "MAIN";
 
 // Application configuration    
-#define APP_VERSION         "1.1.0"
+#define APP_VERSION         "1.0.0"
 #define WIFI_SSID          "NETDISCOVER"
 #define WIFI_PASSWORD      "1233211231"
 #define WIFI_MAX_RETRY     5
