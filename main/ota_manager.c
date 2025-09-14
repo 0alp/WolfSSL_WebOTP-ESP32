@@ -1,5 +1,7 @@
 #include "ota_manager.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
 #include <string.h>
 
 static const char *TAG = "OTA_MANAGER";
@@ -12,8 +14,9 @@ static bool g_ota_active = false;
 static bool g_ota_initialized = false;
 
 #define MAX_HTTP_OUTPUT_BUFFER 2048
+#define OTA_BUFFER_SIZE 1024
 
-// HTTP response handler
+// HTTP response handler for version check
 static esp_err_t ota_http_event_handler(esp_http_client_event_t *evt)
 {
     static int output_len;
@@ -81,14 +84,14 @@ esp_err_t ota_manager_init(const char* server_host, int server_port,
     
     ESP_LOGI(TAG, "OTA Manager being started ...");
     ESP_LOGI(TAG, "Server: %s:%d (%s)", server_host, server_port, use_https ? "HTTPS" : "HTTP");
-    ESP_LOGI(TAG, "Currrent version: %s", current_version);
+    ESP_LOGI(TAG, "Current version: %s", current_version);
     
-    // Register configuration
+    // Store configuration
     strncpy(g_ota_config.server_host, server_host, sizeof(g_ota_config.server_host) - 1);
     g_ota_config.server_port = server_port;
     g_ota_config.use_https = use_https;
     strncpy(g_ota_config.current_version, current_version, sizeof(g_ota_config.current_version) - 1);
-    g_ota_config.check_interval_minutes = 1; 
+    g_ota_config.check_interval_minutes = 5; 
     g_ota_config.auto_restart = true;
     
     g_ota_initialized = true;
@@ -126,9 +129,11 @@ bool ota_manager_check_update(char* latest_version, int* firmware_id)
         .timeout_ms = 10000,
     };
     
+    // Configure HTTPS
     if (g_ota_config.use_https) {
         config.transport_type = HTTP_TRANSPORT_OVER_SSL;
         config.skip_cert_common_name_check = true;
+        config.use_global_ca_store = false;
     }
     
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -143,16 +148,13 @@ bool ota_manager_check_update(char* latest_version, int* firmware_id)
         ESP_LOGI(TAG, "Response: %s", local_response_buffer);
         
         if (status_code == 200) {
-            // JSON parsing
             char *update_available_str = strstr(local_response_buffer, "\"update_available\":");
             if (update_available_str && strstr(update_available_str, "true")) {
-                // Get latest version string 
                 char *latest_version_str = strstr(local_response_buffer, "\"latest_version\":");
                 if (latest_version_str && latest_version) {
                     sscanf(latest_version_str, "\"latest_version\":\"%[^\"]\"", latest_version);
                 }
                 
-                // Get Firmware ID 
                 char *firmware_id_str = strstr(local_response_buffer, "\"id\":");
                 if (firmware_id_str && firmware_id) {
                     sscanf(firmware_id_str, "\"id\":%d", firmware_id);
@@ -164,10 +166,10 @@ bool ota_manager_check_update(char* latest_version, int* firmware_id)
                 update_available = true;
                 
                 if (g_status_callback) {
-                    g_status_callback("Update has been found", 0);
+                    g_status_callback("Update found", 0);
                 }
             } else {
-                ESP_LOGI(TAG, "Current version is used: %s", g_ota_config.current_version);
+                ESP_LOGI(TAG, "Current version is latest: %s", g_ota_config.current_version);
             }
         }
     } else {
@@ -190,7 +192,6 @@ esp_err_t ota_manager_update_firmware(int firmware_id)
     
     char url[256];
     
-    // Create Download URL 
     if (g_ota_config.use_https) {
         snprintf(url, sizeof(url), "https://%s:%d/api/firmware/download/%d", 
                  g_ota_config.server_host, g_ota_config.server_port, firmware_id);
@@ -199,10 +200,10 @@ esp_err_t ota_manager_update_firmware(int firmware_id)
                  g_ota_config.server_host, g_ota_config.server_port, firmware_id);
     }
     
-    ESP_LOGI(TAG, "Firmware downloading: %s", url);
+    ESP_LOGI(TAG, "Downloading firmware: %s", url);
     
     if (g_status_callback) {
-        g_status_callback("Firmware downloading...", 0);
+        g_status_callback("Downloading firmware...", 0);
     }
     
     esp_http_client_config_t config = {
@@ -211,109 +212,174 @@ esp_err_t ota_manager_update_firmware(int firmware_id)
         .keep_alive_enable = true,
     };
     
+    // Configure HTTPS
     if (g_ota_config.use_https) {
         config.transport_type = HTTP_TRANSPORT_OVER_SSL;
-        config.skip_cert_common_name_check = true; // The same issue with [NOTE1] 
+        config.skip_cert_common_name_check = true;
+        config.use_global_ca_store = false;
     }
     
-    esp_https_ota_config_t ota_config = {
-        .http_config = &config,
-        .http_client_init_cb = NULL, 
-        .partial_http_download = true,
-        .max_http_request_size = 1024,
-    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize HTTP client");
+        return ESP_FAIL;
+    }
     
-    esp_https_ota_handle_t https_ota_handle = NULL;
-    esp_err_t err = esp_https_ota_begin(&ota_config, &https_ota_handle);
+    esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ESP HTTPS OTA Begin failed");
-        if (g_status_callback) {
-            g_status_callback("OTA startup error", -1);
-        }
+        ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
         return err;
     }
-
-    esp_app_desc_t app_desc;
-    err = esp_https_ota_get_img_desc(https_ota_handle, &app_desc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "esp_https_ota_read_img_desc failed");
-        goto ota_end;
+    
+    int content_length = esp_http_client_fetch_headers(client);
+    if (content_length < 0) {
+        ESP_LOGE(TAG, "HTTP client fetch headers failed");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
     }
     
-    err = validate_image_header(&app_desc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Image header validation failed");
-        goto ota_end;
+    ESP_LOGI(TAG, "Firmware size: %d bytes", content_length);
+    
+    const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "Failed to find OTA partition");
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
     }
-
+    
+    ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%x",
+             update_partition->subtype, update_partition->address);
+    
+    esp_ota_handle_t update_handle = 0;
+    err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return err;
+    }
+    
+    ESP_LOGI(TAG, "esp_ota_begin succeeded");
+    
     int binary_file_length = 0;
-    int progress_percent = 0;
+    char *upgrade_data_buf = malloc(OTA_BUFFER_SIZE);
+    if (upgrade_data_buf == NULL) {
+        ESP_LOGE(TAG, "Couldn't allocate memory to upgrade data buffer");
+        esp_ota_abort(update_handle);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_ERR_NO_MEM;
+    }
+    
+    esp_app_desc_t new_app_info;
+    bool image_header_was_checked = false;
     
     while (1) {
-        err = esp_https_ota_perform(https_ota_handle);
-        if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
+        int data_read = esp_http_client_read(client, upgrade_data_buf, OTA_BUFFER_SIZE);
+        if (data_read < 0) {
+            ESP_LOGE(TAG, "Error: SSL data read error");
+            break;
+        } else if (data_read > 0) {
+            if (image_header_was_checked == false) {
+                esp_app_desc_t *app_desc = (esp_app_desc_t *)upgrade_data_buf;
+                ESP_LOGI(TAG, "New firmware version: %s", app_desc->version);
+                
+                if (sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t) > data_read) {
+                    ESP_LOGE(TAG, "Received package is not fit len");
+                    break;
+                }
+                
+                memcpy(&new_app_info, &upgrade_data_buf[sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t)], sizeof(esp_app_desc_t));
+                ESP_LOGI(TAG, "New firmware version: %s", new_app_info.version);
+                
+                err = validate_image_header(&new_app_info);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "Image header validation failed");
+                    break;
+                }
+                
+                image_header_was_checked = true;
+            }
+            
+            err = esp_ota_write(update_handle, (const void *)upgrade_data_buf, data_read);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
+                break;
+            }
+            
+            binary_file_length += data_read;
+            ESP_LOGD(TAG, "Written image length %d", binary_file_length);
+            
+            if (content_length > 0) {
+                int progress_percent = (binary_file_length * 100) / content_length;
+                if (g_status_callback) {
+                    g_status_callback("Downloading...", progress_percent);
+                }
+            }
+        } else if (data_read == 0) {
+            ESP_LOGI(TAG, "Connection closed");
             break;
         }
-        binary_file_length += 1024;
-        
-        // Progress callback
-        int new_progress = (binary_file_length * 100) / 1024000; // Assuming max size 1MB for demo
-        if (new_progress != progress_percent && new_progress <= 100) {
-            progress_percent = new_progress;
-            if (g_status_callback) {
-                g_status_callback("Downloading...", progress_percent);
-            }
-        }
-        
-        ESP_LOGD(TAG, "Downloaded data: %d bytes", binary_file_length);
     }
-
-    if (esp_https_ota_is_complete_data_received(https_ota_handle) != true) {
-        ESP_LOGE(TAG, "Complete data was not received.");
-        if (g_status_callback) {
-            g_status_callback("Download error", -1);
-        }
-    } else {
-        ESP_LOGI(TAG, "Firmware download has been completed.. Total: %d bytes", binary_file_length);
-        
-        if (g_status_callback) {
-            g_status_callback("Firmware is being implemented...", 100);
-        }
-        
-        err = esp_https_ota_finish(https_ota_handle);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "ESP HTTPS OTA finish successful");
-            
-            if (g_status_callback) {
-                g_status_callback("Uploading successful, restarting...", 100);
-            }
-            
-            if (g_ota_config.auto_restart) {
-                ESP_LOGI(TAG, "System is being restarted...");
-                vTaskDelay(1000 / portTICK_PERIOD_MS);
-                esp_restart();
-            }
+    
+    ESP_LOGI(TAG, "Total Write binary data length: %d", binary_file_length);
+    
+    if (content_length != binary_file_length) {
+        ESP_LOGE(TAG, "Download incomplete: expected %d bytes, got %d bytes", content_length, binary_file_length);
+        esp_ota_abort(update_handle);
+        free(upgrade_data_buf);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+    
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
+            ESP_LOGE(TAG, "Image validation failed, image is corrupted");
         } else {
-            if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
-                ESP_LOGE(TAG, "ESP HTTPS OTA finish failed: Image validation failed");
-            } else {
-                ESP_LOGE(TAG, "ESP HTTPS OTA finish failed: (%s)!", esp_err_to_name(err));
-            }
-            if (g_status_callback) {
-                g_status_callback("Uploading error", -1);
-            }
+            ESP_LOGE(TAG, "esp_ota_end failed (%s)!", esp_err_to_name(err));
         }
+        free(upgrade_data_buf);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return err;
     }
-
-ota_end:
-    esp_https_ota_abort(https_ota_handle);
-    return err;
+    
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
+        free(upgrade_data_buf);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return err;
+    }
+    
+    ESP_LOGI(TAG, "Firmware update successful");
+    
+    if (g_status_callback) {
+        g_status_callback("Update successful, restarting...", 100);
+    }
+    
+    free(upgrade_data_buf);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    
+    if (g_ota_config.auto_restart) {
+        ESP_LOGI(TAG, "System restarting...");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        esp_restart();
+    }
+    
+    return ESP_OK;
 }
 
-// OTA Control Task
 static void ota_check_task(void *pvParameter)
 {
-    ESP_LOGI(TAG, "OTA control task has been started");
+    ESP_LOGI(TAG, "OTA control task started");
     g_ota_active = true;
     
     while (g_ota_active) {
@@ -323,7 +389,7 @@ static void ota_check_task(void *pvParameter)
         int firmware_id = 0;
         
         if (ota_manager_check_update(latest_version, &firmware_id)) {
-            ESP_LOGI(TAG, "New firmware has been found! Version: %s", latest_version);
+            ESP_LOGI(TAG, "New firmware found! Version: %s", latest_version);
             
             esp_err_t ret = ota_manager_update_firmware(firmware_id);
             if (ret == ESP_OK) {
@@ -336,7 +402,7 @@ static void ota_check_task(void *pvParameter)
         vTaskDelay(pdMS_TO_TICKS(g_ota_config.check_interval_minutes * 60 * 1000));
     }
     
-    ESP_LOGI(TAG, "OTA control task being terminated...");
+    ESP_LOGI(TAG, "OTA control task terminating...");
     g_ota_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -353,7 +419,7 @@ esp_err_t ota_manager_start_check(void)
         return ESP_OK;
     }
     
-    ESP_LOGI(TAG, "OTA control task is being started (interval: %d minutes)...", 
+    ESP_LOGI(TAG, "Starting OTA control task (interval: %d minutes)...", 
              g_ota_config.check_interval_minutes);
     
     BaseType_t ret = xTaskCreate(
@@ -366,7 +432,7 @@ esp_err_t ota_manager_start_check(void)
     );
     
     if (ret != pdPASS) {
-        ESP_LOGE(TAG, "OTA task could not be created");
+        ESP_LOGE(TAG, "Failed to create OTA task");
         return ESP_FAIL;
     }
     
@@ -376,9 +442,8 @@ esp_err_t ota_manager_start_check(void)
 void ota_manager_stop_check(void)
 {
     if (g_ota_task_handle != NULL) {
-        ESP_LOGI(TAG, "OTA control task is being stopped...");
+        ESP_LOGI(TAG, "Stopping OTA control task...");
         g_ota_active = false;
-        
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
@@ -386,20 +451,20 @@ void ota_manager_stop_check(void)
 void ota_manager_set_status_callback(ota_status_callback_t callback)
 {
     g_status_callback = callback;
-    ESP_LOGI(TAG, "OTA status callback has been set");
+    ESP_LOGI(TAG, "OTA status callback set");
 }
 
 void ota_manager_set_check_interval(int minutes)
 {
     if (minutes < 1) minutes = 1;
     g_ota_config.check_interval_minutes = minutes;
-    ESP_LOGI(TAG, "OTA control interval: %d minutes", minutes);
+    ESP_LOGI(TAG, "OTA check interval: %d minutes", minutes);
 }
 
 void ota_manager_set_auto_restart(bool auto_restart)
 {
     g_ota_config.auto_restart = auto_restart;
-    ESP_LOGI(TAG, "Automatic restart: %s", auto_restart ? "OPEN" : "CLOSED");
+    ESP_LOGI(TAG, "Auto restart: %s", auto_restart ? "ENABLED" : "DISABLED");
 }
 
 bool ota_manager_is_active(void)

@@ -29,8 +29,8 @@ static const char *TAG = "MAIN";
 #define WIFI_MAX_RETRY     5
 
 #define SERVER_HOST        "ota.alperenonal.com"
-#define SERVER_PORT        8000
-#define USE_HTTPS         0
+#define SERVER_PORT        443
+#define USE_HTTPS         1
 
 // The function to handle WiFi status changes
 static void on_wifi_status_changed(bool connected, const char* ip_address)
